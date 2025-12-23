@@ -1,0 +1,232 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - workload/env/prod.tfvars
+      - azure-pipelines/env/prod/azure-pipelines-prod.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - workload/env/prod.tfvars
+      - azure-pipelines/env/prod/azure-pipelines-prod.yml
+
+pool:
+  name: 'ado-pool'
+  demands:
+    - Agent.Name -equals ado-vm-01
+
+variables:
+  # Load secrets / TF_VAR_* from variable group
+  - group: aks-prod
+
+  # Plain pipeline variables
+  - name: TF_WORKING_DIR
+    value: 'workload'
+
+  - name: TF_VAR_FILE
+    value: 'env/prod.tfvars'
+
+  - name: TF_BACKEND_RG
+    value: 'rg-tfstate-prod-northeu'
+
+  - name: TF_BACKEND_SA
+    value: 'stgtfladislavprdne01'
+
+  - name: TF_BACKEND_CONTAINER
+    value: 'tfstate'
+
+  - name: TF_BACKEND_KEY
+    value: 'prod.tfstate'
+
+stages:
+# ================= CI =================
+- stage: CI
+  displayName: 'CI - prod (Lint, Validate, Plan)'
+  jobs:
+  - job: CI_prod
+    displayName: 'CI - prod'
+    steps:
+    - checkout: self
+      clean: true
+
+    - bash: |
+        set -euo pipefail
+        terraform version
+      displayName: 'Verify Terraform installed on agent'
+
+    - bash: |
+        set -euo pipefail
+        bash ./azure-pipelines/scripts/install_tools.sh
+      displayName: 'Install TFLint & Gitleaks & TFsec'
+      workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+    - bash: |
+        set -euo pipefail
+        bash ./azure-pipelines/scripts/run_gitleaks.sh
+      displayName: 'Gitleaks - Secret Scan'
+      workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+    - task: Bash@3
+      displayName: 'TFLint – prod (workload)'
+      inputs:
+        filePath: azure-pipelines/scripts/run_tflint.sh
+      env:
+        TF_WORKING_DIR: $(TF_WORKING_DIR)
+
+    - bash: |
+        set -euo pipefail
+        bash ./azure-pipelines/scripts/run_tfsec.sh
+      displayName: 'TFsec - Terraform security scan'
+      workingDirectory: '$(System.DefaultWorkingDirectory)'
+      env:
+        TF_WORKING_DIR: $(TF_WORKING_DIR)
+
+    # DEBUG (optional – remove later)
+    - bash: |
+        set -euo pipefail
+        echo "TF_VAR_aks_sp_client_id (from ADO env mapping) is: ${TF_VAR_aks_sp_client_id:-<not set>}"
+      displayName: 'DEBUG: show TF_VAR_aks_sp_client_id (masked)'
+      env:
+        TF_VAR_aks_sp_client_id: $(TF_VAR_aks_sp_client_id)
+
+    # ---------- Terraform Validate + Plan ----------
+    - task: AzureCLI@2
+      displayName: 'Terraform CI (FMT, Validate, Plan)'
+      inputs:
+        azureSubscription: 'sc-sub-ladislav-prod-sp-01'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        addSpnToEnvironment: true
+        workingDirectory: '$(System.DefaultWorkingDirectory)'
+        inlineScript: |
+          set -euo pipefail
+
+          echo "Configuring Terraform SPN auth (CI)..."
+
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_CLIENT_SECRET="$servicePrincipalKey"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+
+          unset ARM_OIDC_TOKEN ARM_USE_OIDC || true
+
+          bash ./azure-pipelines/scripts/tf_ci.sh
+      env:
+        TF_WORKING_DIR: $(TF_WORKING_DIR)
+        TF_VAR_FILE: $(TF_VAR_FILE)
+        TF_BACKEND_RG: $(TF_BACKEND_RG)
+        TF_BACKEND_SA: $(TF_BACKEND_SA)
+        TF_BACKEND_CONTAINER: $(TF_BACKEND_CONTAINER)
+        TF_BACKEND_KEY: $(TF_BACKEND_KEY)
+        # Map pipeline vars to correctly-cased env vars for Terraform
+        TF_VAR_aks_sp_client_id: $(TF_VAR_aks_sp_client_id)
+        TF_VAR_aks_sp_client_secret: $(TF_VAR_aks_sp_client_secret)
+
+    # ---------- Terraform Plan Summary ----------
+    - task: Bash@3
+      displayName: 'Terraform Plan Summary'
+      inputs:
+        targetType: 'inline'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/$(TF_WORKING_DIR)'
+        script: |
+          set -euo pipefail
+          terraform show -no-color tfplan > tfplan_raw.txt
+
+          {
+            echo '```diff'
+            cat tfplan_raw.txt
+            echo '```'
+          } > TerraformPlan-Summary.md
+
+          echo "##vso[task.uploadsummary]$(System.DefaultWorkingDirectory)/$(TF_WORKING_DIR)/TerraformPlan-Summary.md"
+
+    # ---------- Publish Terraform Plan ----------
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Terraform plan (prod)'
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/$(TF_WORKING_DIR)/tfplan'
+        artifact: 'tfplan-prod'
+        publishLocation: 'pipeline'
+
+# ================= CD =================
+- stage: CD
+  displayName: 'CD - prod (apply on main)'
+  dependsOn: CI
+  condition: |
+    and(
+      succeeded(),
+      eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+      ne(variables['Build.Reason'], 'PullRequest')
+    )
+  jobs:
+  # ---------- Manual Approval ----------
+  - job: Approve_CD_prod
+    displayName: 'Approve CD deployment to prod'
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      displayName: 'Manual approval before applying Terraform to prod'
+      inputs:
+        instructions: 'Review CI results and approve to apply Terraform to prod.'
+        onTimeout: 'reject'
+        timeoutInMinutes: 1440
+
+  # ---------- Terraform Apply ----------
+  - job: CD_prod
+    displayName: 'CD - prod (Terraform apply)'
+    dependsOn: Approve_CD_prod
+    pool:
+      name: 'ado-pool'
+      demands:
+        - Agent.Name -equals ado-vm-01
+    steps:
+    - checkout: self
+      clean: true
+
+    - bash: |
+        set -euo pipefail
+        terraform version
+      displayName: 'Verify Terraform installed on agent'
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Terraform plan (prod)'
+      inputs:
+        artifact: 'tfplan-prod'
+        path: '$(System.DefaultWorkingDirectory)/$(TF_WORKING_DIR)'
+
+    - task: AzureCLI@2
+      displayName: 'Terraform CD (apply approved plan)'
+      inputs:
+        azureSubscription: 'sc-sub-ladislav-prod-sp-01'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        addSpnToEnvironment: true
+        workingDirectory: '$(System.DefaultWorkingDirectory)'
+        inlineScript: |
+          set -euo pipefail
+
+          echo "Configuring Terraform SPN auth (CD)..."
+
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_CLIENT_SECRET="$servicePrincipalKey"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+
+          unset ARM_OIDC_TOKEN ARM_USE_OIDC || true
+
+          bash ./azure-pipelines/scripts/tf_cd.sh
+      env:
+        TF_WORKING_DIR: $(TF_WORKING_DIR)
+        TF_VAR_FILE: $(TF_VAR_FILE)
+        TF_BACKEND_RG: $(TF_BACKEND_RG)
+        TF_BACKEND_SA: $(TF_BACKEND_SA)
+        TF_BACKEND_CONTAINER: $(TF_BACKEND_CONTAINER)
+        TF_BACKEND_KEY: $(TF_BACKEND_KEY)
+        TF_VAR_aks_sp_client_id: $(TF_VAR_aks_sp_client_id)
+        TF_VAR_aks_sp_client_secret: $(TF_VAR_aks_sp_client_secret)
