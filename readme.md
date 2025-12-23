@@ -1,4 +1,4 @@
-#  Azure DevOps CI/CD Pipeline Documentation  
+#  Azure DevSecOps CI/CD Pipeline using TFLINT, GitLeaks & TFSEC  
 
 ## 1 Trigger Conditions
 
